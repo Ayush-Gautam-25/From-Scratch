@@ -1,0 +1,20 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/usr/include/python3.10",            // ✅ Adjust based on your Python version
+                "/usr/local/lib/python3.10/dist-packages/torch/include",           // PyTorch core
+                "/usr/local/lib/python3.10/dist-packages/torch/include/torch/csrc/api/include", // PyTorch C++ API
+                "/usr/include"
+            ],
+            "defines": [],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c17",
+            "cppStandard": "gnu++17",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
