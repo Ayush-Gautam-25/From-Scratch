@@ -3,14 +3,16 @@ import math
 from torch import nn
 import torch.nn.functional as F
 from tqdm import tqdm
+from utils import _damped_inv
 
 class GritKFACFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, lora_A_w, lora_B_w, scaling, dropout_p, k, module_ref):
         """
         x: (B, in)
-        lora_A_w: Parameter tensor shape (r, in)
-        lora_B_w: Parameter tensor shape (out, r)
+        lora_A_w: (r, in)
+        lora_B_w: (out, r)
+        k: number of top directions to retain
         """
         device = x.device
         ctx.module_ref = module_ref
@@ -18,16 +20,14 @@ class GritKFACFunction(torch.autograd.Function):
         ctx.scaling = float(scaling)
         ctx.k = int(k)
 
-        # ensure weights are on same device (they should be, but keep safe)
         lora_A_w = lora_A_w.to(device)
         lora_B_w = lora_B_w.to(device)
 
         if ctx.dropout_p > 0 and module_ref.training:
             mask1 = (torch.rand_like(x, device=device) > ctx.dropout_p).to(x.dtype) / (1.0 - ctx.dropout_p)
             x_masked = x * mask1
-            
-            u = F.linear(x_masked, lora_A_w, bias=None)
 
+            u = F.linear(x_masked, lora_A_w, bias=None)
             mask2 = (torch.rand_like(u, device=device) > ctx.dropout_p).to(u.dtype) / (1.0 - ctx.dropout_p)
             u_final = u * mask2
 
@@ -36,25 +36,19 @@ class GritKFACFunction(torch.autograd.Function):
             x_masked = x
             mask1 = torch.ones_like(x, device=device)
             u_final = F.linear(x, lora_A_w, bias=None)
+
             mask2 = torch.ones_like(u_final, device=device)
+
             ctx.save_for_backward(x, x_masked, u_final, lora_A_w, lora_B_w, mask1, mask2)
 
-        
         delta = F.linear(u_final, lora_B_w, bias=None) * ctx.scaling
 
-        # compute base output using the frozen base linear
         base_out = module_ref.base_layer(x)
         out = base_out + delta
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        """
-        Backward pass that supports inputs with arbitrary leading dims
-        (e.g. [B, S, in_features]). We flatten leading dims -> 2D for matmuls,
-        then reshape back.
-        """
-        
         x, x_masked, u_final, lora_A_w, lora_B_w, mask1, mask2 = ctx.saved_tensors
         module_ref = ctx.module_ref
         scaling = ctx.scaling
@@ -63,7 +57,6 @@ class GritKFACFunction(torch.autograd.Function):
 
         device = grad_output.device
         dtype = grad_output.dtype
-
         g = grad_output.contiguous().to(device=device, dtype=dtype)
 
         in_features = x.shape[-1]
@@ -73,45 +66,61 @@ class GritKFACFunction(torch.autograd.Function):
         g_2d = g.view(-1, out_features)
         x_masked_2d = x_masked.contiguous().view(-1, in_features)
         u_final_2d = u_final.contiguous().view(-1, r)
-        mask1_2d = mask1.contiguous().view(-1, in_features) if mask1 is not None else None
-        mask2_2d = mask2.contiguous().view(-1, r) if mask2 is not None else None
+        
+        mask1_2d = mask1.contiguous().view(-1, in_features)
+        mask2_2d = mask2.contiguous().view(-1, r)
 
         N = max(1.0, float(g_2d.size(0)))
-
         grad_u_final_2d = g_2d.matmul(lora_B_w) * scaling
-
-        if (dropout_p > 0) and (mask2_2d is not None):
+        if dropout_p > 0:
             grad_u_final_2d = grad_u_final_2d * mask2_2d
 
-        # Gradients for LoRA weights (2D)
+        # Gradients for LoRA weights
         grad_lora_A = grad_u_final_2d.t().matmul(x_masked_2d)
         grad_lora_B = g_2d.t().matmul(u_final_2d)
         grad_x_lora_2d = grad_u_final_2d.matmul(lora_A_w)
-
-        if (dropout_p > 0) and (mask1_2d is not None):
+        if dropout_p > 0:
             grad_x_lora_2d = grad_x_lora_2d * mask1_2d
 
-        # Gradient w.r.t inputs from base linear:
         if hasattr(module_ref.base_layer, "weight"):
             base_w = module_ref.base_layer.weight
             grad_x_base_2d = g_2d.matmul(base_w)
         else:
             grad_x_base_2d = torch.zeros_like(grad_x_lora_2d, device=device, dtype=dtype)
 
-        # Combine input gradients and reshape back to original x shape
         grad_x_2d = grad_x_base_2d + grad_x_lora_2d
         grad_x = grad_x_2d.view(*x.shape)
 
-        # Update covariance EMA
-        if module_ref.training and getattr(module_ref, "k", 0) > 0:
+        # --- K-FAC top-k preconditioning using _damped_inv ---
+        if module_ref.training and k > 0:
             with torch.no_grad():
-                A_cov_new = (x_masked_2d.t().matmul(x_masked_2d)) / N 
+                # Update covariance EMA
+                A_cov_new = (x_masked_2d.t() @ x_masked_2d) / N
+                G_cov_new = (g_2d.t() @ g_2d) / N
                 module_ref.A_cov.mul_(module_ref.ema).add_(A_cov_new, alpha=(1.0 - module_ref.ema))
-
-                G_cov_new = (g_2d.t().matmul(g_2d)) / N
                 module_ref.G_cov.mul_(module_ref.ema).add_(G_cov_new, alpha=(1.0 - module_ref.ema))
 
-        # Return gradients for forward args:
+                # Top-k eigen decomposition
+                eigvals_A, eigvecs_A = torch.linalg.eigh(module_ref.A_cov)
+                eigvals_G, eigvecs_G = torch.linalg.eigh(module_ref.G_cov)
+                idx_A = torch.argsort(eigvals_A, descending=True)[:k]
+                idx_G = torch.argsort(eigvals_G, descending=True)[:k]
+
+                U_A = eigvecs_A[:, idx_A]
+                U_G = eigvecs_G[:, idx_G]
+                S_A = torch.diag(eigvals_A[idx_A])
+                S_G = torch.diag(eigvals_G[idx_G])
+
+                # Damped inverses using helper
+                A_inv = _damped_inv(U_A @ S_A @ U_A.T, damping=1e-5)
+                G_inv = _damped_inv(U_G @ S_G @ U_G.T, damping=1e-5)
+
+                # Precondition LoRA gradients
+                with torch.no_grad():
+                    grad_lora_A = grad_lora_A.matmul(A_inv)
+                    grad_lora_B = G_inv.matmul(grad_lora_B)
+
+
         return grad_x, grad_lora_A, grad_lora_B, None, None, None, None
 
 
@@ -155,10 +164,6 @@ class GritLinear(nn.Module):
             # init
             nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
             nn.init.zeros_(self.lora_B.weight)
-
-            # Ensure trainable
-            self.lora_A.weight.requires_grad_(True)
-            self.lora_B.weight.requires_grad_(True)
 
             # covariance buffers (will move with .to(device))
             self.register_buffer("A_cov", torch.eye(in_features, dtype=torch.float32) * 1e-3)
@@ -238,7 +243,6 @@ def get_grit_parameters(model):
     grit_params = []
     for name, module in model.named_modules():
         if isinstance(module, GritLinear) and module.enable_grit:
-            # append Parameter objects (weights)
             grit_params.append(module.lora_A.weight)
             grit_params.append(module.lora_B.weight)
     return grit_params
