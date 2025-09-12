@@ -4,7 +4,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
 
-from grit_tools import apply_grit_to_model, get_grit_parameters, save_grit_weights, evaluate
+from grit_tools import apply_grit_to_model, get_grit_parameters, save_grit_weights, evaluate, reproject_grit_modules
 from utils import count_parameters, freeze_non_grit_parameters
 
 
@@ -55,14 +55,14 @@ def main():
     train_config = {
         "batch_size": 4,
         "learning_rate": 2e-4,
-        "num_epochs": 2,
+        "num_epochs": 20,
         "max_samples": 200,  # small subset for testing
         "gradient_accumulation_steps": 2,
         "eval_steps": 20,
     }
 
     print("\nLoading model and tokenizer...")
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, attn_implementation="eager")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     if tokenizer.pad_token is None:
@@ -119,6 +119,7 @@ def main():
                 torch.nn.utils.clip_grad_norm_(grit_params, 1.0)
                 optimizer.step()
                 scheduler.step()
+                reproject_grit_modules(model)
                 optimizer.zero_grad()
 
             progress.set_postfix({"loss": loss.item() * train_config["gradient_accumulation_steps"]})

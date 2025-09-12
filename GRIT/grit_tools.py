@@ -1,19 +1,20 @@
 import torch
+import torch
 import math
 from torch import nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from utils import _damped_inv
 
+import torch
+import math
+from torch import nn
+import torch.nn.functional as F
+from utils import _damped_inv
+
 class GritKFACFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, lora_A_w, lora_B_w, scaling, dropout_p, k, module_ref):
-        """
-        x: (B, in)
-        lora_A_w: (r, in)
-        lora_B_w: (out, r)
-        k: number of top directions to retain
-        """
         device = x.device
         ctx.module_ref = module_ref
         ctx.dropout_p = float(dropout_p)
@@ -36,13 +37,10 @@ class GritKFACFunction(torch.autograd.Function):
             x_masked = x
             mask1 = torch.ones_like(x, device=device)
             u_final = F.linear(x, lora_A_w, bias=None)
-
             mask2 = torch.ones_like(u_final, device=device)
-
             ctx.save_for_backward(x, x_masked, u_final, lora_A_w, lora_B_w, mask1, mask2)
 
         delta = F.linear(u_final, lora_B_w, bias=None) * ctx.scaling
-
         base_out = module_ref.base_layer(x)
         out = base_out + delta
         return out
@@ -66,7 +64,7 @@ class GritKFACFunction(torch.autograd.Function):
         g_2d = g.view(-1, out_features)
         x_masked_2d = x_masked.contiguous().view(-1, in_features)
         u_final_2d = u_final.contiguous().view(-1, r)
-        
+
         mask1_2d = mask1.contiguous().view(-1, in_features)
         mask2_2d = mask2.contiguous().view(-1, r)
 
@@ -91,52 +89,67 @@ class GritKFACFunction(torch.autograd.Function):
         grad_x_2d = grad_x_base_2d + grad_x_lora_2d
         grad_x = grad_x_2d.view(*x.shape)
 
-        # --- K-FAC top-k preconditioning using _damped_inv ---
+        # --- K-FAC top-k preconditioning using _damped_inv (full-damped inverse of low-rank approx) ---
         if module_ref.training and k > 0:
             with torch.no_grad():
                 # Update covariance EMA
-                A_cov_new = (x_masked_2d.t() @ x_masked_2d) / N
-                G_cov_new = (g_2d.t() @ g_2d) / N
+                A_cov_new = (x_masked_2d.t() @ x_masked_2d) / N        # (in, in)
+                G_cov_new = (g_2d.t() @ g_2d) / N                     # (out, out)
                 module_ref.A_cov.mul_(module_ref.ema).add_(A_cov_new, alpha=(1.0 - module_ref.ema))
                 module_ref.G_cov.mul_(module_ref.ema).add_(G_cov_new, alpha=(1.0 - module_ref.ema))
 
-                # Top-k eigen decomposition
-                eigvals_A, eigvecs_A = torch.linalg.eigh(module_ref.A_cov)
-                eigvals_G, eigvecs_G = torch.linalg.eigh(module_ref.G_cov)
-                idx_A = torch.argsort(eigvals_A, descending=True)[:k]
-                idx_G = torch.argsort(eigvals_G, descending=True)[:k]
+                # update step counter and decide whether to recompute cached inverses
+                module_ref.kfac_step = getattr(module_ref, "kfac_step", 0) + 1
+                update_freq = getattr(module_ref, "kfac_update_freq", 1)
+                damping = getattr(module_ref, "kfac_damping", 1e-5)
+                need_recompute = ((module_ref.kfac_step % update_freq) == 0) or (getattr(module_ref, "kfac_Ainv", None) is None)
 
-                U_A = eigvecs_A[:, idx_A]
-                U_G = eigvecs_G[:, idx_G]
-                S_A = torch.diag(eigvals_A[idx_A])
-                S_G = torch.diag(eigvals_G[idx_G])
+                if need_recompute:
+                    # Top-k eigen decomposition
+                    eigvals_A, eigvecs_A = torch.linalg.eigh(module_ref.A_cov)
+                    eigvals_G, eigvecs_G = torch.linalg.eigh(module_ref.G_cov)
+                    idx_A = torch.argsort(eigvals_A, descending=True)[:k]
+                    idx_G = torch.argsort(eigvals_G, descending=True)[:k]
 
-                # Damped inverses using helper
-                A_inv = _damped_inv(U_A @ S_A @ U_A.T, damping=1e-5)
-                G_inv = _damped_inv(U_G @ S_G @ U_G.T, damping=1e-5)
+                    U_A = eigvecs_A[:, idx_A] 
+                    U_G = eigvecs_G[:, idx_G] 
+                    sA = eigvals_A[idx_A]     
+                    sG = eigvals_G[idx_G]     
 
-                # Precondition LoRA gradients
-                with torch.no_grad():
-                    grad_lora_A = grad_lora_A.matmul(A_inv)
-                    grad_lora_B = G_inv.matmul(grad_lora_B)
+                    # Build low-rank approximations M = U S U^T
+                    U_A = U_A.to(device=device, dtype=dtype)
+                    U_G = U_G.to(device=device, dtype=dtype)
+                    S_A = torch.diag(sA.to(device=device, dtype=dtype))
+                    S_G = torch.diag(sG.to(device=device, dtype=dtype))
 
+                    M_A = U_A.matmul(S_A).matmul(U_A.t())
+                    M_G = U_G.matmul(S_G).matmul(U_G.t())
+
+                    A_inv = _damped_inv(M_A, damping=damping)
+                    G_inv = _damped_inv(M_G, damping=damping)
+
+                    module_ref.kfac_Ainv = A_inv
+                    module_ref.kfac_Ginv = G_inv
+                    module_ref.kfac_UA = U_A
+                    module_ref.kfac_UG = U_G
+                    module_ref.kfac_sA = sA.to(device=device, dtype=dtype)
+                    module_ref.kfac_sG = sG.to(device=device, dtype=dtype)
+                else:
+                    A_inv = module_ref.kfac_Ainv.to(device=device, dtype=dtype)
+                    G_inv = module_ref.kfac_Ginv.to(device=device, dtype=dtype)
+
+                # Precondition LoRA gradients:
+                grad_lora_A = grad_lora_A.matmul(A_inv)
+                grad_lora_B = G_inv.matmul(grad_lora_B)
 
         return grad_x, grad_lora_A, grad_lora_B, None, None, None, None
 
 
-
-# -------------------------
-# GritLinear wrapper
-# -------------------------
+# GritLinear: add kfac_update_freq and kfac_damping defaults + placeholders
 class GritLinear(nn.Module):
     def __init__(self, module: nn.Linear, r=8, alpha=16, k=4,
-                 dropout_p=0.05, enable_grit=True, ema=0.95):
-        """
-        Wrap an existing nn.Linear with a GRIT LoRA + K-FAC bookkeeping.
-        - base layer is frozen (weights not trained)
-        - lora_A: (in -> r), stored as nn.Linear(in, r)
-        - lora_B: (r -> out), stored as nn.Linear(r, out)
-        """
+                 dropout_p=0.05, enable_grit=True, ema=0.95,
+                 kfac_update_freq: int = 1, kfac_damping: float = 1e-5):
         super().__init__()
         assert isinstance(module, nn.Linear), "GritLinear must wrap nn.Linear"
         self.base_layer = module
@@ -147,7 +160,12 @@ class GritLinear(nn.Module):
         self.k = max(1, min(k, r)) if self.enable_grit else 0
         self.ema = float(ema)
 
-        # freeze base layer parameters (they remain in model but are not trained)
+        # K-FAC params
+        self.kfac_update_freq = int(kfac_update_freq)
+        self.kfac_damping = float(kfac_damping)
+        self.kfac_step = 0
+
+        # freeze base layer parameters
         for p in self.base_layer.parameters():
             p.requires_grad = False
 
@@ -155,19 +173,22 @@ class GritLinear(nn.Module):
             in_features = self.base_layer.in_features
             out_features = self.base_layer.out_features
 
-            # define LoRA adapters:
-            # lora_A.weight shape: (r, in)
-            # lora_B.weight shape: (out, r)
             self.lora_A = nn.Linear(in_features, r, bias=False)
             self.lora_B = nn.Linear(r, out_features, bias=False)
-
-            # init
             nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
             nn.init.zeros_(self.lora_B.weight)
 
             # covariance buffers (will move with .to(device))
             self.register_buffer("A_cov", torch.eye(in_features, dtype=torch.float32) * 1e-3)
             self.register_buffer("G_cov", torch.eye(out_features, dtype=torch.float32) * 1e-3)
+
+            # placeholders / caches (not registered buffers)
+            self.kfac_Ainv = None
+            self.kfac_Ginv = None
+            self.kfac_UA = None
+            self.kfac_UG = None
+            self.kfac_sA = None
+            self.kfac_sG = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.enable_grit:
@@ -176,12 +197,37 @@ class GritLinear(nn.Module):
             x, self.lora_A.weight, self.lora_B.weight,
             self.scaling, self.dropout_p, self.k, self
         )
-    
+
+
+    def reproject_to_topk(self):
+        """
+        Explicitly enforce theta_new = U U^T theta for LoRA params using cached U_A / U_G.
+        Call this after optimizer.step() (or periodically).
+        """
+        if not self.enable_grit:
+            return
+
+        if getattr(self, "kfac_UA", None) is None or getattr(self, "kfac_UG", None) is None:
+            return
+
+        device = self.lora_A.weight.device
+        dtype = self.lora_A.weight.dtype
+
+        U_A = self.kfac_UA.to(device=device, dtype=dtype) 
+        U_G = self.kfac_UG.to(device=device, dtype=dtype)
+
+        # compute projection matrices
+        with torch.no_grad():
+            P_A = U_A.matmul(U_A.t())
+            self.lora_A.weight.copy_(self.lora_A.weight.matmul(P_A))
+
+            P_G = U_G.matmul(U_G.t())
+            self.lora_B.weight.copy_(P_G.matmul(self.lora_B.weight))
+
 
 def apply_grit_to_model(model: nn.Module, target_modules=None, **grit_kwargs):
     """
     Replace specific nn.Linear modules in `model` with GritLinear wrappers.
-    Ensures new wrapper is moved to the same device as the original module.
     """
     if target_modules is None:
         target_modules = [
@@ -208,7 +254,6 @@ def apply_grit_to_model(model: nn.Module, target_modules=None, **grit_kwargs):
     name2module = dict(model.named_modules())
     for name, orig_module in layers_to_replace:
         try:
-            # find parent
             if "." in name:
                 parent_name, attr_name = name.rsplit(".", 1)
                 parent = name2module[parent_name]
@@ -216,19 +261,15 @@ def apply_grit_to_model(model: nn.Module, target_modules=None, **grit_kwargs):
                 parent = model
                 attr_name = name
 
-            # create wrapper
             grit_layer = GritLinear(orig_module, **grit_kwargs)
 
-            # find device of original module (fallback to model device)
             try:
                 module_device = next(orig_module.parameters()).device
             except StopIteration:
                 module_device = next(model.parameters()).device if any(True for _ in model.parameters()) else torch.device("cpu")
 
-            # move grit wrapper to the same device so buffers/params align
             grit_layer.to(module_device)
 
-            # set attr on parent
             setattr(parent, attr_name, grit_layer)
             replaced_count += 1
             print(f"Replaced {name} -> GRIT (in:{orig_module.in_features}, out:{orig_module.out_features})")
@@ -246,6 +287,16 @@ def get_grit_parameters(model):
             grit_params.append(module.lora_A.weight)
             grit_params.append(module.lora_B.weight)
     return grit_params
+
+
+def reproject_grit_modules(model):
+    """
+    Call this AFTER optimizer.step() (or periodically)
+    to enforce theta_new = U U^T theta_updated on all GritLinear modules.
+    """
+    for name, module in model.named_modules():
+        if isinstance(module, GritLinear) and module.enable_grit:
+            module.reproject_to_topk()
 
 
 def print_grit_devices(model):
