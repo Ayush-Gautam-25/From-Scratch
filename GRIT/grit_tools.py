@@ -15,14 +15,14 @@ from utils import _damped_inv
 class GritKFACFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, lora_A_w, lora_B_w, scaling, dropout_p, k, module_ref):
-        device = x.device
+        device, dtype = x.device, x.dtype
         ctx.module_ref = module_ref
         ctx.dropout_p = float(dropout_p)
         ctx.scaling = float(scaling)
         ctx.k = int(k)
 
-        lora_A_w = lora_A_w.to(device)
-        lora_B_w = lora_B_w.to(device)
+        lora_A_w = lora_A_w.to(device, dtype=dtype)
+        lora_B_w = lora_B_w.to(device, dtype=dtype)
 
         if ctx.dropout_p > 0 and module_ref.training:
             mask1 = (torch.rand_like(x, device=device) > ctx.dropout_p).to(x.dtype) / (1.0 - ctx.dropout_p)
@@ -177,10 +177,11 @@ class GritLinear(nn.Module):
             self.lora_B = nn.Linear(r, out_features, bias=False)
             nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
             nn.init.zeros_(self.lora_B.weight)
+            param_dtype = next(self.base_layer.parameters()).dtype
 
             # covariance buffers (will move with .to(device))
-            self.register_buffer("A_cov", torch.eye(in_features, dtype=torch.float32) * 1e-3)
-            self.register_buffer("G_cov", torch.eye(out_features, dtype=torch.float32) * 1e-3)
+            self.register_buffer("A_cov", torch.eye(in_features, dtype=param_dtype) * 1e-3)
+            self.register_buffer("G_cov", torch.eye(out_features, dtype=param_dtype) * 1e-3)
 
             # placeholders / caches (not registered buffers)
             self.kfac_Ainv = None
@@ -231,9 +232,11 @@ def apply_grit_to_model(model: nn.Module, target_modules=None, **grit_kwargs):
     """
     if target_modules is None:
         target_modules = [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-            "dense", "linear", "proj", "projection", "down_proj"
+            "q_proj", 
+            # "k_proj",
+            # "v_proj", "o_proj",
+            # "gate_proj", "up_proj", "down_proj",
+            # "dense", "linear", "proj", "projection", "down_proj"
         ]
 
     # collect candidates first
