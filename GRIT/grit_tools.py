@@ -30,6 +30,10 @@ class GritLinear(nn.Module):
             # LoRA parameters
             self.lora_A = nn.Linear(in_features, r, bias=False)
             self.lora_B = nn.Linear(r, out_features, bias=False)
+
+            self.lora_A.weight.data = self.lora_A.weight.data.to(self.base_layer.weight.dtype)
+            self.lora_B.weight.data = self.lora_B.weight.data.to(self.base_layer.weight.dtype)
+
             nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
             nn.init.zeros_(self.lora_B.weight)
 
@@ -37,6 +41,7 @@ class GritLinear(nn.Module):
             self.register_buffer("A_cov", torch.eye(in_features, dtype=torch.float32) * 1e-3)
             self.register_buffer("G_cov", torch.eye(out_features, dtype=torch.float32) * 1e-3)
 
+            # Subspace bases (not registered as buffers to avoid device movement issues)
             self.kfac_UA = None  # Top-k eigenvectors of A_cov
             self.kfac_UG = None  # Top-k eigenvectors of G_cov
             
@@ -55,6 +60,7 @@ class GritLinear(nn.Module):
         # Base layer computation
         base_out = self.base_layer(x)
 
+        
         # LoRA computation with dropout
         if self.dropout_p > 0 and self.training:
             x_dropped = F.dropout(x, p=self.dropout_p, training=self.training)
@@ -122,6 +128,7 @@ def grit_natural_gradient_step(model, optimizer):
                     device = grad_A.device
                     dtype = grad_A.dtype
                     
+                    # Move subspace bases to correct device/dtype
                     UA = module.kfac_UA.to(device=device, dtype=dtype)
                     UG = module.kfac_UG.to(device=device, dtype=dtype)
                     
@@ -129,7 +136,6 @@ def grit_natural_gradient_step(model, optimizer):
                     eigvals_A = torch.linalg.eigvals(module.A_cov).real
                     eigvals_G = torch.linalg.eigvals(module.G_cov).real
                     
-                    # Select top-k eigenvalues (same indices as used in compute_subspace_bases)
                     idx_A = torch.argsort(eigvals_A, descending=True)[:module.k]
                     idx_G = torch.argsort(eigvals_G, descending=True)[:module.k]
                     
@@ -171,15 +177,16 @@ def grit_neural_reprojection(model):
                     device = module.lora_A.weight.device
                     dtype = module.lora_A.weight.dtype
                     
-                    UA = module.kfac_UA.to(device=device, dtype=dtype)
-                    UG = module.kfac_UG.to(device=device, dtype=dtype)
+                    UA = module.kfac_UA.to(device=device, dtype=module.base_layer.weight.dtype)
+                    UG = module.kfac_UG.to(device=device, dtype=module.base_layer.weight.dtype)
+
                     
                     # Neural reprojection: project weights onto top-k subspace
-                    # For lora_A
+                    # For lora_A: project each row onto input subspace
                     proj_A = UA @ UA.T  # Projection matrix
                     module.lora_A.weight.data = module.lora_A.weight.data @ proj_A
                     
-                    # For lora_B 
+                    # For lora_B: project each column onto output subspace  
                     proj_G = UG @ UG.T  # Projection matrix
                     module.lora_B.weight.data = proj_G @ module.lora_B.weight.data
 
@@ -189,10 +196,11 @@ def apply_grit_to_model(model: nn.Module, target_modules=None, **grit_kwargs):
     """
     if target_modules is None:
         target_modules = [
-            "q_proj", "k_proj", "v_proj", "o_proj",
+            "q_proj", "k_proj",
+            #   "v_proj", "o_proj",
             
-            "gate_proj", "up_proj", "down_proj",
-            "dense", "linear", "proj", "projection", "down_proj"
+            # "gate_proj", "up_proj", "down_proj",
+            # "dense", "linear", "proj", "projection", "down_proj"
         ]
 
     # collect candidates first
