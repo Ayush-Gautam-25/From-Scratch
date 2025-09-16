@@ -3,153 +3,11 @@ import torch
 import math
 from torch import nn
 import torch.nn.functional as F
-from tqdm import tqdm
-from utils import _damped_inv
 
-import torch
-import math
-from torch import nn
-import torch.nn.functional as F
-from utils import _damped_inv
-
-class GritKFACFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, lora_A_w, lora_B_w, scaling, dropout_p, k, module_ref):
-        device, dtype = x.device, x.dtype
-        ctx.module_ref = module_ref
-        ctx.dropout_p = float(dropout_p)
-        ctx.scaling = float(scaling)
-        ctx.k = int(k)
-
-        lora_A_w = lora_A_w.to(device, dtype=dtype)
-        lora_B_w = lora_B_w.to(device, dtype=dtype)
-
-        if ctx.dropout_p > 0 and module_ref.training:
-            mask1 = (torch.rand_like(x, device=device) > ctx.dropout_p).to(x.dtype) / (1.0 - ctx.dropout_p)
-            x_masked = x * mask1
-
-            u = F.linear(x_masked, lora_A_w, bias=None)
-            mask2 = (torch.rand_like(u, device=device) > ctx.dropout_p).to(u.dtype) / (1.0 - ctx.dropout_p)
-            u_final = u * mask2
-
-            ctx.save_for_backward(x, x_masked, u_final, lora_A_w, lora_B_w, mask1, mask2)
-        else:
-            x_masked = x
-            mask1 = torch.ones_like(x, device=device)
-            u_final = F.linear(x, lora_A_w, bias=None)
-            mask2 = torch.ones_like(u_final, device=device)
-            ctx.save_for_backward(x, x_masked, u_final, lora_A_w, lora_B_w, mask1, mask2)
-
-        delta = F.linear(u_final, lora_B_w, bias=None) * ctx.scaling
-        base_out = module_ref.base_layer(x)
-        out = base_out + delta
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, x_masked, u_final, lora_A_w, lora_B_w, mask1, mask2 = ctx.saved_tensors
-        module_ref = ctx.module_ref
-        scaling = ctx.scaling
-        k = ctx.k
-        dropout_p = ctx.dropout_p
-
-        device = grad_output.device
-        dtype = grad_output.dtype
-        g = grad_output.contiguous().to(device=device, dtype=dtype)
-
-        in_features = x.shape[-1]
-        out_features = g.shape[-1]
-        r = u_final.shape[-1]
-
-        g_2d = g.view(-1, out_features)
-        x_masked_2d = x_masked.contiguous().view(-1, in_features)
-        u_final_2d = u_final.contiguous().view(-1, r)
-
-        mask1_2d = mask1.contiguous().view(-1, in_features)
-        mask2_2d = mask2.contiguous().view(-1, r)
-
-        N = max(1.0, float(g_2d.size(0)))
-        grad_u_final_2d = g_2d.matmul(lora_B_w) * scaling
-        if dropout_p > 0:
-            grad_u_final_2d = grad_u_final_2d * mask2_2d
-
-        # Gradients for LoRA weights
-        grad_lora_A = grad_u_final_2d.t().matmul(x_masked_2d)
-        grad_lora_B = g_2d.t().matmul(u_final_2d)
-        grad_x_lora_2d = grad_u_final_2d.matmul(lora_A_w)
-        if dropout_p > 0:
-            grad_x_lora_2d = grad_x_lora_2d * mask1_2d
-
-        if hasattr(module_ref.base_layer, "weight"):
-            base_w = module_ref.base_layer.weight
-            grad_x_base_2d = g_2d.matmul(base_w)
-        else:
-            grad_x_base_2d = torch.zeros_like(grad_x_lora_2d, device=device, dtype=dtype)
-
-        grad_x_2d = grad_x_base_2d + grad_x_lora_2d
-        grad_x = grad_x_2d.view(*x.shape)
-
-        # --- K-FAC top-k preconditioning using _damped_inv (full-damped inverse of low-rank approx) ---
-        if module_ref.training and k > 0:
-            with torch.no_grad():
-                # Update covariance EMA
-                A_cov_new = (x_masked_2d.t() @ x_masked_2d) / N        # (in, in)
-                G_cov_new = (g_2d.t() @ g_2d) / N                     # (out, out)
-                module_ref.A_cov.mul_(module_ref.ema).add_(A_cov_new, alpha=(1.0 - module_ref.ema))
-                module_ref.G_cov.mul_(module_ref.ema).add_(G_cov_new, alpha=(1.0 - module_ref.ema))
-
-                # update step counter and decide whether to recompute cached inverses
-                module_ref.kfac_step = getattr(module_ref, "kfac_step", 0) + 1
-                update_freq = getattr(module_ref, "kfac_update_freq", 1)
-                damping = getattr(module_ref, "kfac_damping", 1e-5)
-                need_recompute = ((module_ref.kfac_step % update_freq) == 0) or (getattr(module_ref, "kfac_Ainv", None) is None)
-
-                if need_recompute:
-                    # Top-k eigen decomposition
-                    eigvals_A, eigvecs_A = torch.linalg.eigh(module_ref.A_cov)
-                    eigvals_G, eigvecs_G = torch.linalg.eigh(module_ref.G_cov)
-                    idx_A = torch.argsort(eigvals_A, descending=True)[:k]
-                    idx_G = torch.argsort(eigvals_G, descending=True)[:k]
-
-                    U_A = eigvecs_A[:, idx_A] 
-                    U_G = eigvecs_G[:, idx_G] 
-                    sA = eigvals_A[idx_A]     
-                    sG = eigvals_G[idx_G]     
-
-                    # Build low-rank approximations M = U S U^T
-                    U_A = U_A.to(device=device, dtype=dtype)
-                    U_G = U_G.to(device=device, dtype=dtype)
-                    S_A = torch.diag(sA.to(device=device, dtype=dtype))
-                    S_G = torch.diag(sG.to(device=device, dtype=dtype))
-
-                    M_A = U_A.matmul(S_A).matmul(U_A.t())
-                    M_G = U_G.matmul(S_G).matmul(U_G.t())
-
-                    A_inv = _damped_inv(M_A, damping=damping)
-                    G_inv = _damped_inv(M_G, damping=damping)
-
-                    module_ref.kfac_Ainv = A_inv
-                    module_ref.kfac_Ginv = G_inv
-                    module_ref.kfac_UA = U_A
-                    module_ref.kfac_UG = U_G
-                    module_ref.kfac_sA = sA.to(device=device, dtype=dtype)
-                    module_ref.kfac_sG = sG.to(device=device, dtype=dtype)
-                else:
-                    A_inv = module_ref.kfac_Ainv.to(device=device, dtype=dtype)
-                    G_inv = module_ref.kfac_Ginv.to(device=device, dtype=dtype)
-
-                # Precondition LoRA gradients:
-                grad_lora_A = grad_lora_A.matmul(A_inv)
-                grad_lora_B = G_inv.matmul(grad_lora_B)
-
-        return grad_x, grad_lora_A, grad_lora_B, None, None, None, None
-
-
-# GritLinear: add kfac_update_freq and kfac_damping defaults + placeholders
 class GritLinear(nn.Module):
     def __init__(self, module: nn.Linear, r=8, alpha=16, k=4,
                  dropout_p=0.05, enable_grit=True, ema=0.95,
-                 kfac_update_freq: int = 1, kfac_damping: float = 1e-5):
+                 kfac_damping: float = 1e-5):
         super().__init__()
         assert isinstance(module, nn.Linear), "GritLinear must wrap nn.Linear"
         self.base_layer = module
@@ -159,13 +17,9 @@ class GritLinear(nn.Module):
         self.dropout_p = float(dropout_p) if self.enable_grit else 0.0
         self.k = max(1, min(k, r)) if self.enable_grit else 0
         self.ema = float(ema)
-
-        # K-FAC params
-        self.kfac_update_freq = int(kfac_update_freq)
         self.kfac_damping = float(kfac_damping)
-        self.kfac_step = 0
 
-        # freeze base layer parameters
+        # Freeze base layer parameters
         for p in self.base_layer.parameters():
             p.requires_grad = False
 
@@ -173,58 +27,165 @@ class GritLinear(nn.Module):
             in_features = self.base_layer.in_features
             out_features = self.base_layer.out_features
 
+            # LoRA parameters
             self.lora_A = nn.Linear(in_features, r, bias=False)
             self.lora_B = nn.Linear(r, out_features, bias=False)
             nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
             nn.init.zeros_(self.lora_B.weight)
-            param_dtype = next(self.base_layer.parameters()).dtype
 
-            # covariance buffers (will move with .to(device))
-            self.register_buffer("A_cov", torch.eye(in_features, dtype=param_dtype) * 1e-3)
-            self.register_buffer("G_cov", torch.eye(out_features, dtype=param_dtype) * 1e-3)
+            # K-FAC covariance buffers
+            self.register_buffer("A_cov", torch.eye(in_features, dtype=torch.float32) * 1e-3)
+            self.register_buffer("G_cov", torch.eye(out_features, dtype=torch.float32) * 1e-3)
 
-            # placeholders / caches (not registered buffers)
-            self.kfac_Ainv = None
-            self.kfac_Ginv = None
-            self.kfac_UA = None
-            self.kfac_UG = None
-            self.kfac_sA = None
-            self.kfac_sG = None
+            # Subspace bases (not registered as buffers to avoid device movement issues)
+            self.kfac_UA = None  # Top-k eigenvectors of A_cov
+            self.kfac_UG = None  # Top-k eigenvectors of G_cov
+            
+            # Store activations and gradients for K-FAC updates
+            self.stored_activations = None
+            self.stored_gradients = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.enable_grit:
             return self.base_layer(x)
-        return GritKFACFunction.apply(
-            x, self.lora_A.weight, self.lora_B.weight,
-            self.scaling, self.dropout_p, self.k, self
-        )
 
+        # Store activations for K-FAC update
+        if self.training:
+            self.stored_activations = x.detach()
 
-    def reproject_to_topk(self):
-        """
-        Explicitly enforce theta_new = U U^T theta for LoRA params using cached U_A / U_G.
-        Call this after optimizer.step() (or periodically).
-        """
-        if not self.enable_grit:
+        # Base layer computation
+        base_out = self.base_layer(x)
+
+        # LoRA computation with dropout
+        if self.dropout_p > 0 and self.training:
+            x_dropped = F.dropout(x, p=self.dropout_p, training=self.training)
+            lora_out = self.lora_B(self.lora_A(x_dropped))
+        else:
+            lora_out = self.lora_B(self.lora_A(x))
+
+        return base_out + lora_out * self.scaling
+
+    def update_kfac_statistics(self, grad_output):
+        """Update K-FAC covariance matrices during backward pass"""
+        if not self.training or self.stored_activations is None:
             return
 
-        if getattr(self, "kfac_UA", None) is None or getattr(self, "kfac_UG", None) is None:
-            return
+        # Store gradient for potential use
+        self.stored_gradients = grad_output.detach()
 
-        device = self.lora_A.weight.device
-        dtype = self.lora_A.weight.dtype
+        # Flatten tensors for covariance computation
+        x_flat = self.stored_activations.view(-1, self.stored_activations.shape[-1])
+        g_flat = grad_output.view(-1, grad_output.shape[-1])
+        
+        batch_size = x_flat.shape[0]
 
-        U_A = self.kfac_UA.to(device=device, dtype=dtype) 
-        U_G = self.kfac_UG.to(device=device, dtype=dtype)
-
-        # compute projection matrices
+        # Update covariance matrices with EMA
         with torch.no_grad():
-            P_A = U_A.matmul(U_A.t())
-            self.lora_A.weight.copy_(self.lora_A.weight.matmul(P_A))
+            # Input covariance: A = E[xx^T]
+            A_new = (x_flat.T @ x_flat) / batch_size
+            self.A_cov.mul_(self.ema).add_(A_new, alpha=(1.0 - self.ema))
 
-            P_G = U_G.matmul(U_G.t())
-            self.lora_B.weight.copy_(P_G.matmul(self.lora_B.weight))
+            # Gradient covariance: G = E[gg^T]  
+            G_new = (g_flat.T @ g_flat) / batch_size
+            self.G_cov.mul_(self.ema).add_(G_new, alpha=(1.0 - self.ema))
 
+    def compute_subspace_bases(self):
+        """Compute top-k eigenvector bases for neural reprojection"""
+        if not self.training or self.k <= 0:
+            return
+
+        with torch.no_grad():
+            # Eigendecomposition of covariance matrices
+            eigvals_A, eigvecs_A = torch.linalg.eigh(self.A_cov)
+            eigvals_G, eigvecs_G = torch.linalg.eigh(self.G_cov)
+
+            # Get top-k eigenvectors (largest eigenvalues)
+            idx_A = torch.argsort(eigvals_A, descending=True)[:self.k]
+            idx_G = torch.argsort(eigvals_G, descending=True)[:self.k]
+
+            self.kfac_UA = eigvecs_A[:, idx_A].detach()
+            self.kfac_UG = eigvecs_G[:, idx_G].detach()
+
+def grit_natural_gradient_step(model, optimizer):
+    """
+    Apply GRIT natural gradient update with K-FAC preconditioning.
+    Call this INSTEAD of optimizer.step() when using GRIT.
+    """
+    # First collect gradients and compute natural gradients
+    for name, module in model.named_modules():
+        if isinstance(module, GritLinear) and module.enable_grit:
+            if module.kfac_UA is not None and module.kfac_UG is not None:
+                # Get current gradients
+                grad_A = module.lora_A.weight.grad
+                grad_B = module.lora_B.weight.grad
+                
+                if grad_A is not None and grad_B is not None:
+                    device = grad_A.device
+                    dtype = grad_A.dtype
+                    
+                    # Move subspace bases to correct device/dtype
+                    UA = module.kfac_UA.to(device=device, dtype=dtype)
+                    UG = module.kfac_UG.to(device=device, dtype=dtype)
+                    
+                    # Get eigenvalues for damped inversion
+                    eigvals_A = torch.linalg.eigvals(module.A_cov).real
+                    eigvals_G = torch.linalg.eigvals(module.G_cov).real
+                    
+                    # Select top-k eigenvalues (same indices as used in compute_subspace_bases)
+                    idx_A = torch.argsort(eigvals_A, descending=True)[:module.k]
+                    idx_G = torch.argsort(eigvals_G, descending=True)[:module.k]
+                    
+                    lambda_A = eigvals_A[idx_A].to(device=device, dtype=dtype)
+                    lambda_G = eigvals_G[idx_G].to(device=device, dtype=dtype)
+                    
+                    # Damped inversion in subspace
+                    inv_lambda_A = 1.0 / (lambda_A + module.kfac_damping)
+                    inv_lambda_G = 1.0 / (lambda_G + module.kfac_damping)
+                    
+                    # Natural gradient computation using efficient subspace operations
+                    # For lora_A
+                    # Project gradient to subspace, apply inverse, project back
+                    grad_A_proj = grad_A @ UA  # (r, k)
+                    grad_A_precond = grad_A_proj * inv_lambda_A.unsqueeze(0)  # (r, k)
+                    natural_grad_A = grad_A_precond @ UA.T  # (r, in_features)
+                    
+                    # For lora_B
+                    # Project gradient to subspace, apply inverse, project back
+                    grad_B_proj = UG.T @ grad_B
+                    grad_B_precond = grad_B_proj * inv_lambda_G.unsqueeze(1)
+                    natural_grad_B = UG @ grad_B_precond
+                    
+                    # Replace gradients with natural gradients
+                    module.lora_A.weight.grad = natural_grad_A
+                    module.lora_B.weight.grad = natural_grad_B
+
+    # Apply optimizer step with natural gradients
+    optimizer.step()
+
+
+def grit_neural_reprojection(model):
+    """
+    Apply neural reprojection: θ_new = U_k U_k^T θ_updated
+    Call this AFTER the optimizer step.
+    """
+    with torch.no_grad():
+        for name, module in model.named_modules():
+            if isinstance(module, GritLinear) and module.enable_grit:
+                if module.kfac_UA is not None and module.kfac_UG is not None:
+                    device = module.lora_A.weight.device
+                    dtype = module.lora_A.weight.dtype
+                    
+                    UA = module.kfac_UA.to(device=device, dtype=dtype)
+                    UG = module.kfac_UG.to(device=device, dtype=dtype)
+                    
+                    # Neural reprojection: project weights onto top-k subspace
+                    # For lora_A: project each row onto input subspace
+                    proj_A = UA @ UA.T  # Projection matrix
+                    module.lora_A.weight.data = module.lora_A.weight.data @ proj_A
+                    
+                    # For lora_B: project each column onto output subspace  
+                    proj_G = UG @ UG.T  # Projection matrix
+                    module.lora_B.weight.data = proj_G @ module.lora_B.weight.data
 
 def apply_grit_to_model(model: nn.Module, target_modules=None, **grit_kwargs):
     """
@@ -232,11 +193,10 @@ def apply_grit_to_model(model: nn.Module, target_modules=None, **grit_kwargs):
     """
     if target_modules is None:
         target_modules = [
-            "q_proj", 
-            # "k_proj",
-            # "v_proj", "o_proj",
-            # "gate_proj", "up_proj", "down_proj",
-            # "dense", "linear", "proj", "projection", "down_proj"
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            
+            "gate_proj", "up_proj", "down_proj",
+            "dense", "linear", "proj", "projection", "down_proj"
         ]
 
     # collect candidates first
@@ -291,50 +251,6 @@ def get_grit_parameters(model):
             grit_params.append(module.lora_B.weight)
     return grit_params
 
-
-def reproject_grit_modules(model):
-    """
-    Call this AFTER optimizer.step() (or periodically)
-    to enforce theta_new = U U^T theta_updated on all GritLinear modules.
-    """
-    for name, module in model.named_modules():
-        if isinstance(module, GritLinear) and module.enable_grit:
-            module.reproject_to_topk()
-
-
-def print_grit_devices(model):
-    for name, module in model.named_modules():
-        if isinstance(module, GritLinear):
-            a_dev = module.lora_A.weight.device if hasattr(module, "lora_A") else None
-            b_dev = module.lora_B.weight.device if hasattr(module, "lora_B") else None
-            a_cov = module.A_cov.device if "A_cov" in dict(module.named_buffers()) else None
-            g_cov = module.G_cov.device if "G_cov" in dict(module.named_buffers()) else None
-            print(name, "lora_A:", a_dev, "lora_B:", b_dev, "A_cov:", a_cov, "G_cov:", g_cov)
-
-
-def evaluate(model, val_loader, device):
-    """Evaluate the model on validation set"""
-    model.eval()
-    total_loss = 0
-    num_batches = 0
-    
-    with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Evaluating", leave=False):
-            try:
-                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
-                        for k, v in batch.items()}
-                
-                outputs = model(**batch)
-                total_loss += outputs.loss.item()
-                num_batches += 1
-                
-            except Exception as e:
-                print(f"Evaluation error: {e}")
-                continue
-    
-    return total_loss / max(1, num_batches)
-
-
 def save_grit_weights(model, filename):
     """Save only GRIT weights"""
     grit_state_dict = {}
@@ -345,20 +261,3 @@ def save_grit_weights(model, filename):
     
     torch.save(grit_state_dict, filename)
     print(f"Saved GRIT weights to {filename} ({len(grit_state_dict)} tensors)")
-
-
-def load_grit_weights(model, filename):
-    """Load GRIT weights"""
-    grit_state_dict = torch.load(filename)
-    
-    loaded_count = 0
-    for name, module in model.named_modules():
-        if isinstance(module, GritLinear) and module.enable_grit:
-            if f"{name}.lora_A.weight" in grit_state_dict:
-                module.lora_A.weight.data = grit_state_dict[f"{name}.lora_A.weight"]
-                loaded_count += 1
-            if f"{name}.lora_B.weight" in grit_state_dict:
-                module.lora_B.weight.data = grit_state_dict[f"{name}.lora_B.weight"]
-                loaded_count += 1
-    
-    print(f"Loaded {loaded_count} GRIT weight tensors from {filename}")
