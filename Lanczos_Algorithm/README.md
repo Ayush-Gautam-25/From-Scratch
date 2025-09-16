@@ -5,3 +5,7 @@
 ## References
 - https://en.wikipedia.org/wiki/Lanczos_algorithm (Algorithm)
 - https://arxiv.org/pdf/1901.10159 (An Investigation into Neural Net Optimization via Hessian Eigenvalue Density) (Algorithm 1)
+
+## How to use
+- The tests have been written in `test.py`
+- One can use the Lanczos Algorithm given in the `lanczos.py`
