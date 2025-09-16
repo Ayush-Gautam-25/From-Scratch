@@ -37,7 +37,6 @@ class GritLinear(nn.Module):
             self.register_buffer("A_cov", torch.eye(in_features, dtype=torch.float32) * 1e-3)
             self.register_buffer("G_cov", torch.eye(out_features, dtype=torch.float32) * 1e-3)
 
-            # Subspace bases (not registered as buffers to avoid device movement issues)
             self.kfac_UA = None  # Top-k eigenvectors of A_cov
             self.kfac_UG = None  # Top-k eigenvectors of G_cov
             
@@ -123,7 +122,6 @@ def grit_natural_gradient_step(model, optimizer):
                     device = grad_A.device
                     dtype = grad_A.dtype
                     
-                    # Move subspace bases to correct device/dtype
                     UA = module.kfac_UA.to(device=device, dtype=dtype)
                     UG = module.kfac_UG.to(device=device, dtype=dtype)
                     
@@ -144,13 +142,11 @@ def grit_natural_gradient_step(model, optimizer):
                     
                     # Natural gradient computation using efficient subspace operations
                     # For lora_A
-                    # Project gradient to subspace, apply inverse, project back
                     grad_A_proj = grad_A @ UA  # (r, k)
                     grad_A_precond = grad_A_proj * inv_lambda_A.unsqueeze(0)  # (r, k)
                     natural_grad_A = grad_A_precond @ UA.T  # (r, in_features)
                     
                     # For lora_B
-                    # Project gradient to subspace, apply inverse, project back
                     grad_B_proj = UG.T @ grad_B
                     grad_B_precond = grad_B_proj * inv_lambda_G.unsqueeze(1)
                     natural_grad_B = UG @ grad_B_precond
@@ -179,11 +175,11 @@ def grit_neural_reprojection(model):
                     UG = module.kfac_UG.to(device=device, dtype=dtype)
                     
                     # Neural reprojection: project weights onto top-k subspace
-                    # For lora_A: project each row onto input subspace
+                    # For lora_A
                     proj_A = UA @ UA.T  # Projection matrix
                     module.lora_A.weight.data = module.lora_A.weight.data @ proj_A
                     
-                    # For lora_B: project each column onto output subspace  
+                    # For lora_B 
                     proj_G = UG @ UG.T  # Projection matrix
                     module.lora_B.weight.data = proj_G @ module.lora_B.weight.data
 
